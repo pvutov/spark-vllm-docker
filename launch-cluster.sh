@@ -82,7 +82,7 @@ usage() {
     echo "  -v, --volume    Map a volume in Docker format (e.g. -v /local/path:/container/path). Can be specified multiple times."
     echo "  --ray           Use Ray for multi-node vLLM and add --distributed-executor-backend ray if missing"
     echo "  --no-ray        Default for multi-node vLLM without Ray (accepted for compatibility)"
-    echo "  --no-cache-dirs Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.cache/b12x, ~/.triton, ~/.tilelang)"
+    echo "  --no-cache-dirs Do not mount default cache directories (~/.cache/vllm, ~/.cache/flashinfer, ~/.cache/b12x, ~/.triton, ~/.tilelang, ~/.cache/b12x-traces)"
     echo "  --keep-entrypoint Keep the Docker image entrypoint instead of clearing it by default"
     echo "  --earlyoom      Run earlyoom as the container foreground process (install it with apt-get if missing)"
     echo "  --earlyoom-args Arguments passed to earlyoom (default: '-M 524288,102400 -s 100 -r 60')"
@@ -460,6 +460,12 @@ if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
     # B12X Cache
     DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.cache/b12x:/root/.cache/b12x"
     CACHE_DIRS_TO_CREATE+=("$HOME/.cache/b12x")
+
+    # B12X traces/logs: write-through to $HOME so coordinator/job preparation
+    # traces (B12X_PREPARATION_TRACE_DIR) and any vLLM runtime logs survive
+    # container restarts for post-mortem. Recipes point the trace dir here.
+    DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.cache/b12x-traces:/root/.cache/b12x-traces"
+    CACHE_DIRS_TO_CREATE+=("$HOME/.cache/b12x-traces")
 
     # Triton Cache
     DOCKER_ARGS="$DOCKER_ARGS -v $HOME/.triton:/root/.triton"
