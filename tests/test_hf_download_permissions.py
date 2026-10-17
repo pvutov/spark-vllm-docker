@@ -90,8 +90,22 @@ elif tool == "docker":
     if node not in settings.get("docker_ineffective", []):
         fixed_marker(fields["src"]).touch()
 elif tool == "uvx":
-    assert args == ["hf", "download", "org/model"], args
-    Path(os.environ["TEST_HUB"], "models--org--model").mkdir(parents=True, exist_ok=True)
+    # hf-download.sh drives the resumable download through a single in-process
+    # retry wrapper: `uvx --from huggingface_hub[hf_xet] python3 <helper> ...`.
+    # The helper performs the actual download and retries; the mock stands in
+    # for both uvx and the helper's download by materialising the model dir.
+    assert args[0] == "--from", args
+    assert "huggingface_hub[hf_xet]" in args[1], args
+    assert args[2] == "python3", args
+    assert args[3].endswith("hf-resume-download.py"), args
+    assert "org/model" in args[4:], args
+    hub = Path(os.environ["TEST_HUB"])
+    target = hub / "models--org--model"
+    target.mkdir(parents=True, exist_ok=True)
+elif tool == "sleep":
+    # Never actually sleep during tests; record each requested delay so tests
+    # can assert on the adaptive backoff sequence.
+    sys.exit(0)
 elif tool == "ssh":
     assert args[:2] == ["-o", "BatchMode=yes"], args
     tty_flag, target, command = args[2:]
@@ -131,7 +145,7 @@ class CachePermissionsTests(unittest.TestCase):
             "TEST_REAL_FIND": shutil.which("find"),
             "TEST_REAL_ID": shutil.which("id"),
         }
-        for tool in ("find", "id", "sudo", "docker", "uvx", "ssh", "rsync"):
+        for tool in ("find", "id", "sudo", "docker", "uvx", "ssh", "rsync", "sleep"):
             path = self.bin / tool
             path.write_text(MOCK_TOOL)
             path.chmod(0o755)
@@ -422,6 +436,19 @@ class CachePermissionsTests(unittest.TestCase):
                 self.run_download(success=False)
                 self.assertFalse(self.calls_for("sudo"))
                 self.assertFalse(self.calls_for("uvx"))
+
+    def test_download_invokes_in_process_resume_wrapper(self):
+        # The shell no longer retries in a loop; it delegates to the single
+        # in-process resumable download helper (hf-resume-download.py). Retry
+        # and backoff behavior is unit-tested in test_hf_resume_download.py.
+        self.run_download()
+        uvx = self.calls_for("uvx")
+        self.assertEqual(len(uvx), 1)
+        # It should pass the model id plus the retry parameters through.
+        joined = " ".join(uvx[0]["args"])
+        self.assertIn("hf-resume-download.py", joined)
+        self.assertIn("org/model", joined)
+        self.assertIn("--retries", joined)
 
 
 if __name__ == "__main__":

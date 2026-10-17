@@ -329,6 +329,24 @@ for additional launcher options.
 
 ## CHANGELOG
 
+### 2026-10-17
+
+`hf-download.sh` downloads now retry in a single long-lived process instead of
+rerunning `uvx hf download` for every attempt. A large model can take hours
+over the WAN and drop mid-transfer; a fresh process per attempt discarded
+partial per-shard progress (huggingface_hub writes to process-unique temp
+files and the Xet chunk cache is size-capped), so the retry effectively
+restarted from zero each time. The download now goes through
+`hf-resume-download.py`, which calls `snapshot_download` repeatedly inside one
+process so the Xet CAS session and chunk cache stay warm and a later attempt
+resumes from where the previous one stopped.
+
+Retry policy: `--retries <n|unlimited>` (default 3; `forever`/`infinite` are
+aliases for unlimited), `--retry-delay <sec>` (initial backoff, default 5),
+`--retry-max-delay <sec>` (cap, default 1800 = 30min). Backoff doubles each
+retry up to the cap. Also configurable via `HF_DOWNLOAD_RETRIES`,
+`HF_DOWNLOAD_RETRY_DELAY`, `HF_DOWNLOAD_RETRY_MAX_DELAY`.
+
 ### 2026-10-16
 
 'glm-5.3-flash` recipe now uses a new FP4-Local checkpoint from NVIDIA, replacing an older version hosted in local-inference-lab repository. As with Qwen, this checkpoint features compressed scales and is QAD quantized. Up to 2M KV cache on dual Sparks!

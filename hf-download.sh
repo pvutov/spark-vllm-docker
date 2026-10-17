@@ -14,9 +14,14 @@ BACKUP_DIR=""
 OUTPUT_FORMAT=console
 SORT_ORDER=size:desc
 LIST_OPTIONS=false
+DOWNLOAD_RETRIES=${HF_DOWNLOAD_RETRIES:-3}
+DOWNLOAD_RETRY_DELAY=${HF_DOWNLOAD_RETRY_DELAY:-5}
+DOWNLOAD_RETRY_MAX_DELAY=${HF_DOWNLOAD_RETRY_MAX_DELAY:-1800}
 MODEL_NAME=""
 REVISION=""
-CACHE_HELPER="$(dirname "$(realpath "${BASH_SOURCE[0]}")")/hf-cache.py"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CACHE_HELPER="$SCRIPT_DIR/hf-cache.py"
+DOWNLOAD_HELPER="$SCRIPT_DIR/hf-resume-download.py"
 
 # Help function
 usage() {
@@ -31,6 +36,9 @@ usage() {
     echo "  --backup-dir <path>        : Existing backup directory on the head node."
     echo "  --force                    : Skip deletion/cleanup confirmation."
     echo "  --revision <revision>      : Back up/delete one cached commit (hash, unique prefix, branch, or tag)."
+    echo "  --retries <n|unlimited>   : Retries after a failed download (default: ${HF_DOWNLOAD_RETRIES:-3}); 'unlimited' retries forever."
+    echo "  --retry-delay <sec>        : Initial delay before the first retry (default: ${HF_DOWNLOAD_RETRY_DELAY:-5}); doubles each retry."
+    echo "  --retry-max-delay <sec>    : Backoff cap (default: ${HF_DOWNLOAD_RETRY_MAX_DELAY:-1800}s = 30min)."
     echo "  --format console|csv|json|md : Listing output format (default: console)."
     echo "  --sort <order>             : hf cache ls sort order (default: size:desc)."
     echo "  -c, --copy-to [hosts]       : Include peers. Omit hosts to use COPY_HOSTS from .env or autodiscovery."
@@ -356,6 +364,9 @@ while [[ "$#" -gt 0 ]]; do
         --delete) DELETE_REQUESTED=true ;;
         --force) FORCE=true ;;
         --revision) require_value "$@"; REVISION="$2"; shift ;;
+        --retries) require_value "$@"; DOWNLOAD_RETRIES="$2"; shift ;;
+        --retry-delay) require_value "$@"; DOWNLOAD_RETRY_DELAY="$2"; shift ;;
+        --retry-max-delay) require_value "$@"; DOWNLOAD_RETRY_MAX_DELAY="$2"; shift ;;
         --backup-dir) require_value "$@"; BACKUP_DIR="$2"; shift ;;
         --format) require_value "$@"; OUTPUT_FORMAT="$2"; LIST_OPTIONS=true; shift ;;
         --sort) require_value "$@"; SORT_ORDER="$2"; LIST_OPTIONS=true; shift ;;
@@ -402,6 +413,10 @@ esac
     || fail "--revision requires --backup or --delete."
 [[ "$PARALLEL_COPY" == false || ( "$COPY_TO_FLAG" == true && ( "$ACTION" == download || "$ACTION" == restore ) ) ]] \
     || fail "--copy-parallel requires -c and a download or restore."
+[[ "$DOWNLOAD_RETRIES" =~ ^[0-9]+$ || "$DOWNLOAD_RETRIES" =~ ^(unlimited|forever|infinite)$ ]] \
+    || fail "--retries must be a non-negative integer or 'unlimited'."
+[[ "$DOWNLOAD_RETRY_DELAY" =~ ^[0-9]+$ ]] || fail "--retry-delay must be a non-negative integer."
+[[ "$DOWNLOAD_RETRY_MAX_DELAY" =~ ^[0-9]+$ ]] || fail "--retry-max-delay must be a non-negative integer."
 python3 "$CACHE_HELPER" validate --model "$MODEL_NAME" --revision "$REVISION" --format "$OUTPUT_FORMAT" --sort "$SORT_ORDER"
 
 # Export config so autodiscover.sh picks it up
@@ -496,14 +511,31 @@ if [[ "$ACTION" == restore ]]; then
     python3 "$CACHE_HELPER" restore --cache-dir "$HUB_PATH" --backup-dir "$BACKUP_DIR" --model "$MODEL_NAME"
     DOWNLOAD_TIME=$(($(date +%s) - DOWNLOAD_START))
 else
+    # A large model can take hours over the WAN, and a single transfer can
+    # drop mid-download. Rerunning a fresh process for each attempt discards
+    # partial per-shard progress (huggingface_hub writes to process-unique temp
+    # files, and Xet chunk cache is capped), so we drive the download from a
+    # SINGLE long-lived process that retries `snapshot_download` in place. That
+    # keeps the Xet CAS session and chunk cache warm, so a later attempt resumes
+    # rather than restarting from zero. Retries are bounded or 'unlimited' with
+    # exponential backoff capped at DOWNLOAD_RETRY_MAX_DELAY (default 30min).
     echo "Downloading model '$MODEL_NAME' using uvx..."
-    if uvx hf download "$MODEL_NAME"; then
-        DOWNLOAD_END=$(date +%s)
-        DOWNLOAD_TIME=$((DOWNLOAD_END - DOWNLOAD_START))
-        printf "Download completed in %02d:%02d:%02d\n" $((DOWNLOAD_TIME/3600)) $((DOWNLOAD_TIME%3600/60)) $((DOWNLOAD_TIME%60))
-    else
-        fail "Failed to download model '$MODEL_NAME'."
+    if ! uvx --from "huggingface_hub[hf_xet]" python3 \
+            "$DOWNLOAD_HELPER" "$MODEL_NAME" \
+            --cache-dir "$HUB_PATH" \
+            --retries "$DOWNLOAD_RETRIES" \
+            --retry-delay "$DOWNLOAD_RETRY_DELAY" \
+            --retry-max-delay "$DOWNLOAD_RETRY_MAX_DELAY"; then
+        if [[ "$DOWNLOAD_RETRIES" =~ ^(unlimited|forever|infinite)$ ]]; then
+            # 'unlimited' only fails on non-retryable errors (e.g. auth/validation).
+            fail "Failed to download model '$MODEL_NAME'."
+        else
+            fail "Failed to download model '$MODEL_NAME' after $((DOWNLOAD_RETRIES + 1)) attempts."
+        fi
     fi
+    DOWNLOAD_END=$(date +%s)
+    DOWNLOAD_TIME=$((DOWNLOAD_END - DOWNLOAD_START))
+    printf "Download completed in %02d:%02d:%02d\n" $((DOWNLOAD_TIME/3600)) $((DOWNLOAD_TIME%3600/60)) $((DOWNLOAD_TIME%60))
 fi
 
 # Determine model directory path

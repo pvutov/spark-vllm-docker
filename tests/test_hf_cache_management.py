@@ -81,9 +81,13 @@ if tool == "rsync":
         sys.exit(result.returncode)
     os.execv(os.environ["TEST_RSYNC"], ["rsync", *args])
 assert tool == "uvx", (tool, args)
-if args[:2] == ["hf", "download"]:
-    assert len(args) == 3, args
-    (Path(mapping[node]) / ("models--" + args[2].replace("/", "--"))).mkdir(exist_ok=True)
+if args[:2] == ["--from", "huggingface_hub[hf_xet]"]:
+    # hf-download.sh now drives downloads through the single in-process
+    # resumable helper; the mock stands in for the helper by materialising the
+    # model dir.
+    assert args[2] == "python3" and args[3].endswith("hf-resume-download.py"), args
+    model = next(a for a in args[4:] if not a.startswith("--"))
+    (Path(mapping[node]) / ("models--" + model.replace("/", "--"))).mkdir(exist_ok=True)
     sys.exit(0)
 assert args[:2] == ["hf", "cache"], args
 cache = Path(args[args.index("--cache-dir") + 1])
@@ -437,9 +441,10 @@ detect_copy_hosts() { COPY_PEER_NODES=(peer2 peer1); }
                       ("org/model", "-c", "peer1", "--copy-parallel")):
             with self.subTest(flags=flags):
                 self.run_script(*flags)
-        downloads = [call for call in self.calls() if call["args"][:2] == ["hf", "download"]]
+        downloads = [call for call in self.calls()
+                     if call["args"][:2] == ["--from", "huggingface_hub[hf_xet]"]]
         self.assertEqual(len(downloads), 3)
-        self.assertTrue(all(call["args"][-1] == "org/model" for call in downloads))
+        self.assertTrue(all("org/model" in call["args"] for call in downloads))
 
     def test_delete_confirmation_force_and_remote_only(self):
         repo = self.model(self.peer1)
